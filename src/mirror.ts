@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -26,8 +26,8 @@ interface EntitiesResponse {
 }
 
 interface MirrorState {
-  phase: 'not_started' | 'bulk_sync' | 'chain_connection' | 'incremental_polling';
-  pis: Record<string, number>; // pi -> version
+  phase: 'not_started' | 'bulk_sync' | 'polling';
+  cursor_pi: string | null; // Most recent PI we've seen
   connected: boolean;
   backoff_seconds: number;
   last_poll_time: string | null;
@@ -38,12 +38,14 @@ class ArkeIPFSMirror {
   private apiBaseUrl: string;
   private state: MirrorState;
   private stateFilePath: string;
+  private dataFilePath: string;
   private minBackoff = 30;
   private maxBackoff = 600;
 
-  constructor(apiBaseUrl: string, stateFilePath?: string) {
+  constructor(apiBaseUrl: string, stateFilePath?: string, dataFilePath?: string) {
     this.apiBaseUrl = apiBaseUrl;
     this.stateFilePath = stateFilePath || join(dirname(__dirname), 'mirror-state.json');
+    this.dataFilePath = dataFilePath || join(dirname(__dirname), 'mirror-data.jsonl');
     this.state = this.loadState();
   }
 
@@ -59,7 +61,7 @@ class ArkeIPFSMirror {
 
     return {
       phase: 'not_started',
-      pis: {},
+      cursor_pi: null,
       connected: false,
       backoff_seconds: this.minBackoff,
       last_poll_time: null,
@@ -75,6 +77,15 @@ class ArkeIPFSMirror {
     }
   }
 
+  private appendEntity(entry: EntityEntry): void {
+    try {
+      appendFileSync(this.dataFilePath, JSON.stringify(entry) + '\n', 'utf-8');
+    } catch (error) {
+      console.error('Error appending entity:', error);
+      throw error;
+    }
+  }
+
   // Phase 1: Bulk Sync
   private async bulkSync(): Promise<void> {
     console.log('=== Phase 1: Bulk Sync ===');
@@ -85,8 +96,8 @@ class ArkeIPFSMirror {
 
       if (response.status === 404) {
         console.log('No snapshot exists yet - system is new');
-        console.log('Skipping to chain connection phase');
-        this.state.phase = 'chain_connection';
+        console.log('Skipping to polling phase');
+        this.state.phase = 'polling';
         this.state.connected = true;
         this.saveState();
         return;
@@ -102,14 +113,20 @@ class ArkeIPFSMirror {
       console.log(`  - Time: ${snapshot.snapshot_time}`);
       console.log(`  - Total entities: ${snapshot.total_count}`);
 
-      // Load entities from snapshot
+      // Append entities from snapshot to data file
       for (const entry of snapshot.entries) {
-        this.state.pis[entry.pi] = entry.ver;
+        this.appendEntity(entry);
         console.log(`  Loaded: ${entry.pi} (v${entry.ver})`);
       }
 
-      this.state.total_entities = Object.keys(this.state.pis).length;
-      this.state.phase = 'chain_connection';
+      // Set cursor to most recent entry (first in snapshot)
+      if (snapshot.entries.length > 0) {
+        this.state.cursor_pi = snapshot.entries[0].pi;
+      }
+
+      this.state.total_entities = snapshot.total_count;
+      this.state.phase = 'polling';
+      this.state.connected = true;
       this.saveState();
 
       console.log(`\nBulk sync complete: ${this.state.total_entities} entities loaded`);
@@ -119,13 +136,10 @@ class ArkeIPFSMirror {
     }
   }
 
-  // Phase 2: Chain Connection
-  private async connectChains(): Promise<void> {
-    console.log('\n=== Phase 2: Chain Connection ===');
-    console.log('Walking live chain backwards to find overlap...');
-
-    const seenPis = new Set(Object.keys(this.state.pis));
-    let cursor: string | undefined = undefined;
+  // Unified sync: Walk backwards from HEAD until finding cursor
+  private async syncFromCursor(): Promise<{ updates: number }> {
+    const cursor_pi = this.state.cursor_pi;
+    let apiCursor: string | undefined = undefined;
     const newEntities: EntityEntry[] = [];
     let pollCount = 0;
 
@@ -133,11 +147,10 @@ class ArkeIPFSMirror {
       while (true) {
         pollCount++;
         let url = `${this.apiBaseUrl}/entities?limit=100`;
-        if (cursor) {
-          url += `&cursor=${cursor}`;
+        if (apiCursor) {
+          url += `&cursor=${apiCursor}`;
         }
 
-        console.log(`  Poll ${pollCount}: fetching...`);
         const response = await fetch(url);
 
         if (!response.ok) {
@@ -145,111 +158,64 @@ class ArkeIPFSMirror {
         }
 
         const data = await response.json() as EntitiesResponse;
-        let foundOverlap = false;
+        let foundCursor = false;
 
         for (const entity of data.items) {
-          if (seenPis.has(entity.pi)) {
-            // Found the connection point!
-            foundOverlap = true;
-            console.log(`  ✓ Connected chains at PI: ${entity.pi}`);
+          if (cursor_pi && entity.pi === cursor_pi) {
+            // Found our cursor! Stop accumulating
+            foundCursor = true;
+            console.log(`  ✓ Found cursor at PI: ${entity.pi}`);
             break;
           } else {
-            // New entity not in snapshot
+            // New entity we haven't seen
             newEntities.push(entity);
-            seenPis.add(entity.pi);
           }
         }
 
-        if (foundOverlap) {
+        if (foundCursor) {
           break;
         }
 
         if (!data.has_more) {
-          // Reached end of chain without finding overlap
-          console.log('  Reached end of chain - no overlap needed (fresh system)');
+          // Reached end of chain without finding cursor (fresh system or genesis)
+          console.log('  Reached end of chain');
           break;
         }
 
-        cursor = data.next_cursor;
+        apiCursor = data.next_cursor;
       }
 
-      // Store new entities in order (reverse since we walked backwards)
-      console.log(`\nAdding ${newEntities.length} new entities found since snapshot:`);
-      for (const entity of newEntities.reverse()) {
-        this.state.pis[entity.pi] = entity.ver;
-        console.log(`  New: ${entity.pi} (v${entity.ver})`);
-      }
-
-      this.state.total_entities = Object.keys(this.state.pis).length;
-      this.state.connected = true;
-      this.state.phase = 'incremental_polling';
-      this.saveState();
-
-      console.log(`\nChain connection complete!`);
-      console.log(`  - Total entities: ${this.state.total_entities}`);
-      console.log(`  - Ready for incremental polling`);
-    } catch (error) {
-      console.error('Chain connection failed:', error);
-      throw error;
-    }
-  }
-
-  // Phase 3: Incremental Polling
-  private async pollForUpdates(): Promise<{ updates: number; allSeen: boolean }> {
-    try {
-      const response = await fetch(`${this.apiBaseUrl}/entities?limit=50`);
-
-      if (!response.ok) {
-        throw new Error(`Poll failed: ${response.status}`);
-      }
-
-      const data = await response.json() as EntitiesResponse;
-
-      let updates = 0;
-      let allSeen = true;
-
-      for (const entity of data.items) {
-        const { pi, ver } = entity;
-        const localVer = this.state.pis[pi];
-
-        if (localVer === undefined) {
-          // New PI
-          this.state.pis[pi] = ver;
-          updates++;
-          allSeen = false;
-          console.log(`  NEW: ${pi} (v${ver})`);
-        } else if (localVer < ver) {
-          // Updated PI (version increased)
-          console.log(`  UPDATE: ${pi} v${localVer} -> v${ver}`);
-          this.state.pis[pi] = ver;
-          updates++;
-          allSeen = false;
+      // Append new entities in correct order (reverse since we walked backwards)
+      const updates = newEntities.length;
+      if (updates > 0) {
+        console.log(`\nAdding ${updates} new entities:`);
+        for (const entity of newEntities.reverse()) {
+          this.appendEntity(entity);
+          console.log(`  New: ${entity.pi} (v${entity.ver})`);
         }
-        // else: Already have this exact version, skip
+
+        // Update cursor to most recent entity
+        this.state.cursor_pi = newEntities[0].pi;
+        this.state.total_entities += updates;
       }
 
-      this.state.total_entities = Object.keys(this.state.pis).length;
       this.state.last_poll_time = new Date().toISOString();
       this.saveState();
 
-      return { updates, allSeen };
+      return { updates };
     } catch (error) {
-      console.error('Poll failed:', error);
+      console.error('Sync from cursor failed:', error);
       throw error;
     }
   }
 
-  // Initialize: Phase 1 + 2
+  // Initialize
   async initialize(): Promise<void> {
     if (this.state.phase === 'not_started') {
       await this.bulkSync();
     }
 
-    if (this.state.phase === 'chain_connection' && !this.state.connected) {
-      await this.connectChains();
-    }
-
-    if (this.state.phase === 'incremental_polling') {
+    if (this.state.phase === 'polling') {
       console.log('\n=== Mirror Already Initialized ===');
       console.log(`  - Total entities: ${this.state.total_entities}`);
       console.log(`  - Last poll: ${this.state.last_poll_time || 'never'}`);
@@ -257,26 +223,26 @@ class ArkeIPFSMirror {
     }
   }
 
-  // Main poll loop (Phase 3)
+  // Main poll loop
   async pollLoop(): Promise<void> {
     if (!this.state.connected) {
       throw new Error('Must call initialize() first');
     }
 
-    console.log('\n=== Phase 3: Incremental Polling ===');
+    console.log('\n=== Continuous Polling ===');
     console.log('Starting continuous polling with exponential backoff...\n');
 
     while (true) {
       console.log(`[${new Date().toISOString()}] Polling for updates...`);
 
       try {
-        const { updates, allSeen } = await this.pollForUpdates();
+        const { updates } = await this.syncFromCursor();
 
         if (updates > 0) {
           // Activity detected - reset to minimum
           console.log(`  Found ${updates} updates, resetting backoff`);
           this.state.backoff_seconds = this.minBackoff;
-        } else if (allSeen) {
+        } else {
           // No new data - increase backoff
           this.state.backoff_seconds = Math.min(
             this.state.backoff_seconds * 2,
@@ -302,7 +268,8 @@ class ArkeIPFSMirror {
   async run(): Promise<void> {
     console.log('=== Arke IPFS Mirror Starting ===');
     console.log(`API Base URL: ${this.apiBaseUrl}`);
-    console.log(`State File: ${this.stateFilePath}\n`);
+    console.log(`State File: ${this.stateFilePath}`);
+    console.log(`Data File: ${this.dataFilePath}\n`);
 
     await this.initialize();
     await this.pollLoop();
@@ -329,10 +296,11 @@ async function main() {
   // Get API base URL from environment or use default
   const apiBaseUrl = process.env.ARKE_API_URL || 'http://localhost:3000';
 
-  // Get state file path from environment (for Docker/Fly.io deployment)
+  // Get file paths from environment (for Docker/Fly.io deployment)
   const stateFilePath = process.env.STATE_FILE_PATH;
+  const dataFilePath = process.env.DATA_FILE_PATH;
 
-  const mirror = new ArkeIPFSMirror(apiBaseUrl, stateFilePath);
+  const mirror = new ArkeIPFSMirror(apiBaseUrl, stateFilePath, dataFilePath);
 
   // Handle graceful shutdown
   process.on('SIGINT', () => {

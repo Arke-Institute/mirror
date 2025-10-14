@@ -4,8 +4,9 @@ node_modules/
 # Build output
 dist/
 
-# State file (contains local mirror data)
+# State and data files (contains local mirror data)
 mirror-state.json
+mirror-data.jsonl
 
 # Docker volume data
 data/
