@@ -12,6 +12,7 @@ data/
 
 # Fly.io specific files (internal use only)
 fly.toml
+FLY_IO_DEPLOYMENT.md
 .fly/
 
 # Logs
