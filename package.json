@@ -1,0 +1,20 @@
+{
+  "name": "arke-ipfs-mirror",
+  "version": "1.0.0",
+  "description": "Local mirroring client for Arke IPFS entity system",
+  "type": "module",
+  "main": "dist/mirror.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node --enable-source-maps dist/mirror.js",
+    "dev": "tsc && npm start"
+  },
+  "keywords": ["arke", "ipfs", "mirror"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {}
+}
