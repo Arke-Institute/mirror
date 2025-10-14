@@ -7,6 +7,13 @@ dist/
 # State file (contains local mirror data)
 mirror-state.json
 
+# Docker volume data
+data/
+
+# Fly.io specific files (internal use only)
+fly.toml
+.fly/
+
 # Logs
 *.log
 npm-debug.log*

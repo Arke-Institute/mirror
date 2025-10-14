@@ -329,7 +329,10 @@ async function main() {
   // Get API base URL from environment or use default
   const apiBaseUrl = process.env.ARKE_API_URL || 'http://localhost:3000';
 
-  const mirror = new ArkeIPFSMirror(apiBaseUrl);
+  // Get state file path from environment (for Docker/Fly.io deployment)
+  const stateFilePath = process.env.STATE_FILE_PATH;
+
+  const mirror = new ArkeIPFSMirror(apiBaseUrl, stateFilePath);
 
   // Handle graceful shutdown
   process.on('SIGINT', () => {
