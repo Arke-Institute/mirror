@@ -54,6 +54,8 @@ interface MirrorState {
   backoff_seconds: number;
   last_poll_time: string | null;
   total_entities: number;
+  last_snapshot_seq: number | null; // Sequence number of last integrated snapshot
+  last_snapshot_check_time: string | null; // When we last checked for new snapshot
 }
 
 class ArkeIPFSMirror {
@@ -63,6 +65,7 @@ class ArkeIPFSMirror {
   private dataFilePath: string;
   private minBackoff = 30;
   private maxBackoff = 600;
+  private snapshotRefreshInterval = 30 * 1000; // 30 seconds for testing (normally 12 * 60 * 60 * 1000 for 12 hours)
 
   constructor(apiBaseUrl: string, stateFilePath?: string, dataFilePath?: string) {
     this.apiBaseUrl = apiBaseUrl;
@@ -88,6 +91,8 @@ class ArkeIPFSMirror {
       backoff_seconds: this.minBackoff,
       last_poll_time: null,
       total_entities: 0,
+      last_snapshot_seq: null,
+      last_snapshot_check_time: null,
     };
   }
 
@@ -147,6 +152,8 @@ class ArkeIPFSMirror {
       this.state.cursor_event_cid = snapshot.event_cid;
 
       this.state.total_entities = snapshot.total_count;
+      this.state.last_snapshot_seq = snapshot.seq;
+      this.state.last_snapshot_check_time = new Date().toISOString();
       this.state.phase = 'polling';
       this.state.connected = true;
       this.saveState();
@@ -155,6 +162,81 @@ class ArkeIPFSMirror {
     } catch (error) {
       console.error('Bulk sync failed:', error);
       throw error;
+    }
+  }
+
+  // Check for new snapshot and refresh data if available
+  private async checkAndRefreshSnapshot(): Promise<boolean> {
+    console.log('\n=== Checking for new snapshot ===');
+
+    try {
+      // First, check headers only (efficient - doesn't download body)
+      const abortController = new AbortController();
+      const headResponse = await fetch(`${this.apiBaseUrl}/snapshot/latest`, {
+        signal: abortController.signal
+      });
+
+      if (headResponse.status === 404) {
+        console.log('No snapshot exists yet');
+        this.state.last_snapshot_check_time = new Date().toISOString();
+        this.saveState();
+        abortController.abort(); // Cancel the request
+        return false;
+      }
+
+      if (!headResponse.ok) {
+        abortController.abort();
+        throw new Error(`Snapshot fetch failed: ${headResponse.status}`);
+      }
+
+      // Read metadata from headers (without downloading body)
+      const newSeq = parseInt(headResponse.headers.get('x-snapshot-seq') || '0', 10);
+      const newCount = parseInt(headResponse.headers.get('x-snapshot-count') || '0', 10);
+
+      // Check if this snapshot is newer than the last one we integrated
+      if (this.state.last_snapshot_seq !== null && newSeq <= this.state.last_snapshot_seq) {
+        console.log(`Current snapshot (seq ${newSeq}) is not newer than last integrated (seq ${this.state.last_snapshot_seq})`);
+        this.state.last_snapshot_check_time = new Date().toISOString();
+        this.saveState();
+        abortController.abort(); // Cancel the request - don't download body
+        return false;
+      }
+
+      console.log(`Found newer snapshot!`);
+      console.log(`  - Previous seq: ${this.state.last_snapshot_seq || 'none'}`);
+      console.log(`  - New seq: ${newSeq}`);
+      console.log(`  - Total entities: ${newCount}`);
+
+      // Now fetch the full snapshot body since we need it
+      const snapshot = await headResponse.json() as SnapshotResponse;
+
+      console.log(`  - Time: ${snapshot.ts}`);
+      console.log(`  - Event CID: ${snapshot.event_cid}`);
+
+      // Truncate and rewrite the data file with snapshot entries
+      console.log('Compacting data file with snapshot entries...');
+      writeFileSync(this.dataFilePath, '', 'utf-8'); // Clear file
+
+      for (const entry of snapshot.entries) {
+        this.appendData(entry);
+      }
+
+      console.log(`Compaction complete: ${snapshot.total_count} entities written`);
+
+      // Update state with new snapshot info
+      this.state.cursor_event_cid = snapshot.event_cid;
+      this.state.total_entities = snapshot.total_count;
+      this.state.last_snapshot_seq = snapshot.seq;
+      this.state.last_snapshot_check_time = new Date().toISOString();
+      this.saveState();
+
+      return true;
+    } catch (error) {
+      console.error('Snapshot refresh failed:', error);
+      // Update check time even on failure to avoid hammering the API
+      this.state.last_snapshot_check_time = new Date().toISOString();
+      this.saveState();
+      return false;
     }
   }
 
@@ -257,6 +339,21 @@ class ArkeIPFSMirror {
 
     while (true) {
       console.log(`[${new Date().toISOString()}] Polling for updates...`);
+
+      // Check if we should refresh from snapshot (every 12 hours)
+      const now = Date.now();
+      const lastCheckTime = this.state.last_snapshot_check_time
+        ? new Date(this.state.last_snapshot_check_time).getTime()
+        : 0;
+      const timeSinceLastCheck = now - lastCheckTime;
+
+      if (timeSinceLastCheck >= this.snapshotRefreshInterval) {
+        try {
+          await this.checkAndRefreshSnapshot();
+        } catch (error) {
+          console.error('Snapshot refresh check failed, continuing with regular polling:', error);
+        }
+      }
 
       try {
         const { updates } = await this.syncFromCursor();
