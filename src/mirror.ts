@@ -14,9 +14,14 @@ interface EntityEntry {
 }
 
 interface SnapshotResponse {
-  entries: EntityEntry[];
-  snapshot_time: string;
+  schema: string;
+  seq: number;
+  ts: string;
+  event_cid: string;
   total_count: number;
+  prev_snapshot?: { '/': string };
+  entries: EntityEntry[];
+  snapshot_time?: string; // Legacy field, may not be present
 }
 
 interface EntitiesResponse {
@@ -25,9 +30,26 @@ interface EntitiesResponse {
   next_cursor?: string;
 }
 
+interface Event {
+  event_cid: string;
+  type: 'create' | 'update';
+  pi: string;
+  ver: number;
+  tip_cid: string;
+  ts: string;
+}
+
+interface EventsResponse {
+  items: Event[];
+  total_events: number;
+  total_pis: number;
+  has_more: boolean;
+  next_cursor?: string;
+}
+
 interface MirrorState {
   phase: 'not_started' | 'bulk_sync' | 'polling';
-  cursor_pi: string | null; // Most recent PI we've seen
+  cursor_event_cid: string | null; // Most recent event CID we've seen
   connected: boolean;
   backoff_seconds: number;
   last_poll_time: string | null;
@@ -61,7 +83,7 @@ class ArkeIPFSMirror {
 
     return {
       phase: 'not_started',
-      cursor_pi: null,
+      cursor_event_cid: null,
       connected: false,
       backoff_seconds: this.minBackoff,
       last_poll_time: null,
@@ -77,11 +99,11 @@ class ArkeIPFSMirror {
     }
   }
 
-  private appendEntity(entry: EntityEntry): void {
+  private appendData(data: EntityEntry | Event): void {
     try {
-      appendFileSync(this.dataFilePath, JSON.stringify(entry) + '\n', 'utf-8');
+      appendFileSync(this.dataFilePath, JSON.stringify(data) + '\n', 'utf-8');
     } catch (error) {
-      console.error('Error appending entity:', error);
+      console.error('Error appending data:', error);
       throw error;
     }
   }
@@ -110,19 +132,19 @@ class ArkeIPFSMirror {
       const snapshot = await response.json() as SnapshotResponse;
 
       console.log(`Snapshot metadata:`);
-      console.log(`  - Time: ${snapshot.snapshot_time}`);
+      console.log(`  - Time: ${snapshot.ts}`);
+      console.log(`  - Sequence: ${snapshot.seq}`);
+      console.log(`  - Event CID: ${snapshot.event_cid}`);
       console.log(`  - Total entities: ${snapshot.total_count}`);
 
       // Append entities from snapshot to data file
       for (const entry of snapshot.entries) {
-        this.appendEntity(entry);
+        this.appendData(entry);
         console.log(`  Loaded: ${entry.pi} (v${entry.ver})`);
       }
 
-      // Set cursor to most recent entry (first in snapshot)
-      if (snapshot.entries.length > 0) {
-        this.state.cursor_pi = snapshot.entries[0].pi;
-      }
+      // Set cursor to snapshot's event_cid (checkpoint in event stream)
+      this.state.cursor_event_cid = snapshot.event_cid;
 
       this.state.total_entities = snapshot.total_count;
       this.state.phase = 'polling';
@@ -138,15 +160,15 @@ class ArkeIPFSMirror {
 
   // Unified sync: Walk backwards from HEAD until finding cursor
   private async syncFromCursor(): Promise<{ updates: number }> {
-    const cursor_pi = this.state.cursor_pi;
+    const cursor_event_cid = this.state.cursor_event_cid;
     let apiCursor: string | undefined = undefined;
-    const newEntities: EntityEntry[] = [];
+    const newEvents: Event[] = [];
     let pollCount = 0;
 
     try {
       while (true) {
         pollCount++;
-        let url = `${this.apiBaseUrl}/entities?limit=100`;
+        let url = `${this.apiBaseUrl}/events?limit=100`;
         if (apiCursor) {
           url += `&cursor=${apiCursor}`;
         }
@@ -154,21 +176,21 @@ class ArkeIPFSMirror {
         const response = await fetch(url);
 
         if (!response.ok) {
-          throw new Error(`Entities fetch failed: ${response.status}`);
+          throw new Error(`Events fetch failed: ${response.status}`);
         }
 
-        const data = await response.json() as EntitiesResponse;
+        const data = await response.json() as EventsResponse;
         let foundCursor = false;
 
-        for (const entity of data.items) {
-          if (cursor_pi && entity.pi === cursor_pi) {
+        for (const event of data.items) {
+          if (cursor_event_cid && event.event_cid === cursor_event_cid) {
             // Found our cursor! Stop accumulating
             foundCursor = true;
-            console.log(`  ✓ Found cursor at PI: ${entity.pi}`);
+            console.log(`  ✓ Found cursor at event CID: ${event.event_cid}`);
             break;
           } else {
-            // New entity we haven't seen
-            newEntities.push(entity);
+            // New event we haven't seen
+            newEvents.push(event);
           }
         }
 
@@ -185,18 +207,19 @@ class ArkeIPFSMirror {
         apiCursor = data.next_cursor;
       }
 
-      // Append new entities in correct order (reverse since we walked backwards)
-      const updates = newEntities.length;
+      // Append new events in correct order (reverse since we walked backwards)
+      const updates = newEvents.length;
       if (updates > 0) {
-        console.log(`\nAdding ${updates} new entities:`);
-        for (const entity of newEntities.reverse()) {
-          this.appendEntity(entity);
-          console.log(`  New: ${entity.pi} (v${entity.ver})`);
+        console.log(`\nAdding ${updates} new events:`);
+        for (const event of newEvents.reverse()) {
+          this.appendData(event);
+          console.log(`  ${event.type}: ${event.pi} (v${event.ver}) - ${event.event_cid}`);
         }
 
-        // Update cursor to most recent entity
-        this.state.cursor_pi = newEntities[0].pi;
-        this.state.total_entities += updates;
+        // Update cursor to most recent event (last one appended, which is at end of reversed array)
+        this.state.cursor_event_cid = newEvents[newEvents.length - 1].event_cid;
+        // Note: We don't increment total_entities here since updates can happen to same PI
+        // The total_entities from snapshot is a count of unique PIs, not events
       }
 
       this.state.last_poll_time = new Date().toISOString();
