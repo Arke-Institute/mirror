@@ -38,6 +38,281 @@ GET /events?limit=100&cursor={next_cursor}
 - No updates detected → double backoff (30s to 600s max)
 - Updates detected → reset to minimum backoff (30s)
 
+## Catchup Logic: How the Mirror Stays Synchronized
+
+The mirror's catchup mechanism ensures eventual consistency regardless of how far behind it falls. The system uses a **backwards-walking algorithm** to efficiently discover all missed events.
+
+### Core Algorithm: syncFromCursor()
+
+The `syncFromCursor()` method implements the catchup logic:
+
+```typescript
+async syncFromCursor() {
+  const cursor_event_cid = this.state.cursor_event_cid;  // Last known event
+  let apiCursor = undefined;
+  const newEvents = [];
+
+  // Walk backwards from HEAD until finding our cursor
+  while (true) {
+    const response = await fetch(`/events?limit=100&cursor=${apiCursor}`);
+    const data = await response.json();
+
+    for (const event of data.items) {
+      if (event.event_cid === cursor_event_cid) {
+        // Found where we left off!
+        foundCursor = true;
+        break;
+      } else {
+        // New event we haven't seen yet
+        newEvents.push(event);
+      }
+    }
+
+    if (foundCursor) break;
+    if (!data.has_more) break;  // Reached genesis
+
+    apiCursor = data.next_cursor;  // Continue backwards
+  }
+
+  // Append events in chronological order (reverse the backwards walk)
+  for (const event of newEvents.reverse()) {
+    this.appendData(event);
+  }
+
+  // Update cursor to most recent event
+  this.state.cursor_event_cid = newEvents[newEvents.length - 1].event_cid;
+}
+```
+
+### How It Works
+
+**Step 1: Start from HEAD (Most Recent)**
+```
+Current HEAD: event #1050
+Mirror cursor: event #1000
+```
+
+**Step 2: Walk Backwards Through Pagination**
+```
+Request 1: GET /events?limit=100
+  Returns: events #1050-951 (100 events)
+  Check each: #1050, #1049, ..., #951
+  Found cursor? No → Continue
+
+Request 2: GET /events?limit=100&cursor={next}
+  Returns: events #950-1000
+  Check each: #950, #951, ..., #1000
+  Found cursor? Yes! → Stop
+```
+
+**Step 3: Accumulate Missed Events**
+```
+newEvents = [#1050, #1049, #1048, ..., #1001]
+Total accumulated: 50 events
+```
+
+**Step 4: Replay in Chronological Order**
+```
+Reverse array: [#1001, #1002, ..., #1050]
+Append to JSONL in order
+Update cursor to #1050
+```
+
+### Catchup Scenarios
+
+#### Scenario 1: Mirror Down for 1 Hour (50 Events Behind)
+
+```
+Last known cursor: event #1000
+Current HEAD: event #1050
+Gap: 50 events
+
+Catchup Process:
+  - Pagination cycles: 1 (all events in first 100-item page)
+  - Events replayed: 50
+  - Time to catchup: ~2 seconds
+  - Result: cursor updated to #1050
+```
+
+#### Scenario 2: Mirror Down for 1 Day (2,000 Events Behind)
+
+```
+Last known cursor: event #1000
+Current HEAD: event #3000
+Gap: 2,000 events
+
+Catchup Process:
+  - Pagination cycles: 20 (2000 events ÷ 100 per page)
+  - Events replayed: 2,000
+  - Network requests: 20
+  - Time to catchup: ~30-60 seconds
+  - Result: cursor updated to #3000
+```
+
+#### Scenario 3: Mirror Down for 1 Week (10,000 Events Behind)
+
+```
+Last known cursor: event #1000
+Current HEAD: event #11000
+Gap: 10,000 events
+
+Catchup Process:
+  - Pagination cycles: 100 (10,000 events ÷ 100 per page)
+  - Events replayed: 10,000
+  - Network requests: 100
+  - Time to catchup: ~5-10 minutes
+  - JSONL file growth: 10,000 lines added
+  - Result: cursor updated to #11000
+```
+
+### Fast Catchup via Snapshot Refresh
+
+For large gaps, the **periodic snapshot refresh** provides a more efficient catchup method:
+
+```
+Option 1 - Event Replay (Traditional):
+  Mirror down for 1 week
+  → 10,000 events to download and replay
+  → ~1 MB of event data
+  → 100 API requests
+  → 5-10 minutes to catchup
+  → JSONL grows by 10,000 lines
+
+Option 2 - Snapshot Refresh (Efficient):
+  Mirror down for 1 week
+  → Download latest snapshot instead
+  → ~600 KB for 2,500 current entities
+  → 1 API request
+  → 2 seconds to catchup
+  → JSONL set to exactly 2,500 lines (compacted)
+```
+
+**When Snapshot Refresh Triggers:**
+- Every 12 hours (configurable via `snapshotRefreshInterval`)
+- OR when `timeSinceLastCheck >= snapshotRefreshInterval`
+
+**Snapshot Catchup Logic:**
+```typescript
+if (timeSinceLastCheck >= snapshotRefreshInterval) {
+  // Check if newer snapshot available (header-only check)
+  const newSeq = parseInt(response.headers.get('x-snapshot-seq'));
+
+  if (newSeq > last_snapshot_seq) {
+    // Found newer snapshot - fast catchup!
+    const snapshot = await response.json();
+
+    // Truncate JSONL and replace with current state
+    writeFileSync(dataFile, '');
+    for (const entry of snapshot.entries) {
+      appendData(entry);
+    }
+
+    // Jump cursor to snapshot position
+    cursor_event_cid = snapshot.event_cid;
+
+    // Continue polling from here
+    // (No need to replay 10,000 historical events!)
+  }
+}
+```
+
+### Edge Cases
+
+**Cursor Never Found (Genesis Reached)**
+```
+If the mirror walks all the way back without finding the cursor:
+  - Reaches !data.has_more (beginning of event chain)
+  - Assumes all events from genesis forward are new
+  - Replays entire event history
+  - Use case: Fresh mirror or corrupted state
+```
+
+**No Events Yet**
+```
+If /events returns empty:
+  - newEvents array is empty
+  - No updates appended
+  - Cursor remains unchanged
+  - Use case: Brand new system with no entities yet
+```
+
+**Cursor in Future (Clock Skew)**
+```
+If saved cursor_event_cid doesn't exist yet:
+  - Backwards walk reaches genesis without finding it
+  - Replays all events from beginning
+  - Eventually syncs when real cursor event appears
+  - Use case: Restored from backup with future state
+```
+
+### Performance Considerations
+
+**Memory Usage During Catchup:**
+```typescript
+const newEvents = [];  // Accumulates all missed events in memory
+
+Example: 10,000 missed events
+  Each event: ~200 bytes
+  Total memory: ~2 MB (acceptable)
+```
+
+**Network Efficiency:**
+```
+Batch size: 100 events per request (configurable via ?limit=100)
+Pagination: Sequential (can't parallelize due to cursor dependency)
+```
+
+**Disk I/O:**
+```typescript
+for (const event of newEvents.reverse()) {
+  this.appendData(event);  // One write per event
+}
+
+Optimization opportunity: Could batch writes for large catchups
+Current: 10,000 events = 10,000 appendFileSync calls
+Better: Accumulate and write in chunks of 1000
+```
+
+### Catchup Strategy Decision Tree
+
+```
+Is mirror behind?
+  │
+  ├─ Yes, < 100 events behind
+  │   └─→ Use event replay (syncFromCursor)
+  │       Fast, minimal overhead
+  │
+  ├─ Yes, 100-1000 events behind
+  │   └─→ Use event replay (syncFromCursor)
+  │       Still efficient, 1-10 API requests
+  │
+  ├─ Yes, 1000-10000 events behind
+  │   └─→ Wait for next snapshot refresh (if within 12h)
+  │       OR use event replay if urgent
+  │       Snapshot refresh is ~100x more efficient
+  │
+  └─ Yes, > 10000 events behind
+      └─→ Force snapshot refresh
+          Downloading snapshot is much faster than
+          replaying 10,000+ individual events
+```
+
+### Guarantees
+
+**Eventual Consistency:**
+- No matter how far behind, mirror will eventually catch up
+- All events are processed in chronological order
+- No events are skipped or duplicated
+
+**No Data Loss:**
+- Cursor tracking ensures continuity
+- Even if mirror crashes mid-catchup, it resumes from last saved cursor
+- State file is saved after each successful poll iteration
+
+**Idempotency:**
+- Re-running catchup with same cursor is safe
+- Events already appended won't be duplicated (cursor prevents re-processing)
+
 ## Periodic Snapshot Refresh (New Feature)
 
 ### The Problem
