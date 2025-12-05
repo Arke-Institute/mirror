@@ -6,37 +6,149 @@ The Arke IPFS Mirror maintains a local replica of the Arke IPFS entity system by
 
 ## System Architecture
 
+### API Integration
+
+The mirror communicates with a single Arke API endpoint (configurable via `ARKE_API_URL` environment variable, defaults to `http://localhost:3000`). It uses two HTTP endpoints:
+
+1. **`GET /snapshot/latest`** - Downloads complete system state
+   - Used during initial bulk sync
+   - Used periodically for data compaction
+   - Returns: Snapshot with all current entities
+   - Headers: `x-snapshot-seq`, `x-snapshot-count`
+
+2. **`GET /events?limit=100&cursor={cursor}`** - Retrieves event stream
+   - Used during continuous polling
+   - Supports pagination via cursor parameter
+   - Returns: List of events with `has_more` and `next_cursor` for pagination
+   - Events are ordered from most recent (HEAD) backwards in time
+
+**Note**: The mirror does NOT poll multiple systems or separate wrapper/server APIs. All data comes from a single unified API endpoint.
+
 ### Data Storage
 
 The mirror maintains two local files:
 
 1. **State File** (`mirror-state.json`): Tracks synchronization state
-2. **Data File** (`mirror-data.jsonl`): JSONL file containing entity data
+2. **Data File** (`mirror-data.jsonl`): JSONL file containing entity data and events
+
+#### Data File Structure
+
+The JSONL file contains two types of objects:
+
+**EntityEntry** (from snapshots):
+```typescript
+{
+  pi: string;        // Entity identifier
+  ver: number;       // Version number
+  tip_cid: string;   // CID of the current entity state
+}
+```
+
+**Event** (from polling):
+```typescript
+{
+  event_cid: string;           // Unique event identifier (used as cursor)
+  type: 'create' | 'update';   // Event type
+  pi: string;                  // Entity identifier
+  ver: number;                 // Version number after this event
+  tip_cid: string;             // CID of entity state after this event
+  ts: string;                  // ISO 8601 timestamp
+}
+```
+
+After bulk sync, the file contains EntityEntry objects. During polling, Event objects are appended. When a snapshot refresh occurs, the file is truncated and repopulated with EntityEntry objects from the new snapshot.
+
+#### State File Structure
+
+The state file (`mirror-state.json`) tracks the mirror's operational state:
+
+```typescript
+{
+  phase: 'not_started' | 'bulk_sync' | 'polling';  // Current operational phase
+  cursor_event_cid: string | null;                 // Last processed event CID (cursor position)
+  connected: boolean;                               // Whether mirror is connected to API
+  backoff_seconds: number;                          // Current polling backoff interval
+  last_poll_time: string | null;                    // ISO timestamp of last poll
+  total_entities: number;                           // Count of unique entities (from last snapshot)
+  last_snapshot_seq: number | null;                 // Sequence number of last integrated snapshot
+  last_snapshot_check_time: string | null;          // ISO timestamp of last snapshot check
+}
+```
+
+**Key State Tracking**:
+- **`cursor_event_cid`**: The event CID that represents "how far" the mirror has processed in the event stream. This is the anchor point for catchup logic.
+- **`last_snapshot_seq`**: Monotonically increasing sequence number. When a newer snapshot is available (higher seq), the mirror can compact its data file.
+- **`backoff_seconds`**: Implements exponential backoff (30s-600s). Doubles when no updates found, resets to 30s when updates detected.
 
 ### Mirror Phases
 
 #### Phase 1: Bulk Sync
-On first run, the mirror downloads the latest snapshot from `/snapshot/latest` to establish the initial state:
+On first run, the mirror downloads the latest snapshot from `/snapshot/latest` to establish the initial state.
 
+**Snapshot Response Structure**:
+```typescript
+{
+  schema: string;                     // Schema version
+  seq: number;                        // Monotonically increasing sequence number
+  ts: string;                         // ISO 8601 timestamp of snapshot creation
+  event_cid: string;                  // Event CID that this snapshot represents
+  total_count: number;                // Total number of entities in snapshot
+  prev_snapshot?: { '/': string };    // Link to previous snapshot (optional)
+  entries: EntityEntry[];             // Array of current entity states
+}
 ```
-GET /snapshot/latest
-→ Returns all entities with current versions
-→ Stores event_cid as cursor for subsequent polling
+
+**Bulk Sync Process**:
 ```
+1. GET /snapshot/latest
+2. Check response.status:
+   - 404: No snapshot yet (new system), skip to polling
+   - 200: Download and process snapshot
+3. Append all snapshot.entries to JSONL file
+4. Set cursor_event_cid = snapshot.event_cid
+5. Save snapshot.seq for future refresh checks
+6. Transition to polling phase
+```
+
+The `event_cid` from the snapshot becomes the initial cursor position, representing the point in the event stream where this snapshot was created.
 
 #### Phase 2: Continuous Polling
-The mirror polls `/events` to discover new events since the last known cursor:
+The mirror continuously polls `/events` to discover new events since the last known cursor position.
 
-```
-GET /events?limit=100&cursor={next_cursor}
-→ Walk backwards from HEAD until finding known cursor
-→ Append new events in chronological order
-→ Update cursor to most recent event
+**Events Response Structure**:
+```typescript
+{
+  items: Event[];          // Array of events (most recent first)
+  total_events: number;    // Total number of events in the system
+  total_pis: number;       // Total number of unique entities
+  has_more: boolean;       // Whether more events exist (for pagination)
+  next_cursor?: string;    // Cursor for next page (if has_more is true)
+}
 ```
 
-**Exponential Backoff:**
+**Polling Algorithm**:
+```
+1. Start at HEAD (most recent events): GET /events?limit=100
+2. Walk backwards through pagination until finding cursor_event_cid
+   - Check each event.event_cid against stored cursor_event_cid
+   - If not found and has_more is true: GET /events?limit=100&cursor={next_cursor}
+3. Accumulate all new events encountered during the walk
+4. Reverse the accumulated events (to restore chronological order)
+5. Append events to JSONL file
+6. Update cursor_event_cid to most recent event (first in chronological order, last in reversed array)
+```
+
+**Cursor Mechanics**:
+- The `cursor_event_cid` is stored in state and points to the last event the mirror has processed
+- On each poll, the mirror walks backwards from HEAD until it finds this event CID
+- Everything encountered before finding the cursor is a "new" event that needs to be processed
+- After processing, the cursor advances to the newest event CID
+- If the cursor is never found (e.g., walked all the way to genesis), all events are considered new
+
+**Exponential Backoff**:
 - No updates detected → double backoff (30s to 600s max)
 - Updates detected → reset to minimum backoff (30s)
+- Prevents excessive API calls when system is idle
 
 ## Catchup Logic: How the Mirror Stays Synchronized
 
@@ -360,25 +472,33 @@ interface MirrorState {
 
 #### Efficient Header Checks
 
-The system uses HTTP headers to detect new snapshots without downloading the body:
+The system uses HTTP headers to detect new snapshots before downloading the full response body:
 
 ```typescript
-// Check headers only (efficient)
-const response = await fetch('/snapshot/latest');
-const newSeq = parseInt(response.headers.get('x-snapshot-seq'));
-const newCount = parseInt(response.headers.get('x-snapshot-count'));
+// Initiate request with abort controller
+const abortController = new AbortController();
+const response = await fetch('/snapshot/latest', {
+  signal: abortController.signal
+});
+
+// Read headers (available immediately, before body download)
+const newSeq = parseInt(response.headers.get('x-snapshot-seq') || '0');
+const newCount = parseInt(response.headers.get('x-snapshot-count') || '0');
 
 // Only download body if sequence increased
 if (newSeq > state.last_snapshot_seq) {
   const snapshot = await response.json();
   // Perform compaction...
+} else {
+  abortController.abort();  // Cancel body download
 }
 ```
 
-**Headers Available:**
-- `x-snapshot-cid`: CID of the snapshot
-- `x-snapshot-seq`: Sequence number (increments with each new snapshot)
-- `x-snapshot-count`: Total entity count
+**Response Headers Used**:
+- `x-snapshot-seq`: Monotonically increasing sequence number (used to detect new snapshots)
+- `x-snapshot-count`: Total entity count (informational)
+
+**Efficiency**: When no new snapshot is available, the request is aborted before downloading the full response body, saving bandwidth and time.
 
 #### Compaction Process
 
@@ -491,17 +611,21 @@ Poll 3:      Finds events #1051-1055 → cursor = event #1055
 
 ### Refresh Interval
 
-Default: 12 hours (`12 * 60 * 60 * 1000` ms)
+**Current setting**: 30 seconds (`30 * 1000` ms) - **FOR TESTING ONLY**
+**Production default**: 12 hours (`12 * 60 * 60 * 1000` ms)
 
-To change (in `src/mirror.ts`):
+The current code in `src/mirror.ts` line 68 is set to 30 seconds for testing purposes. For production deployments, this should be changed to 12 hours or another appropriate interval based on your update frequency and storage constraints.
+
+To change the interval (in `src/mirror.ts`):
 
 ```typescript
+// Production setting (recommended)
+private snapshotRefreshInterval = 12 * 60 * 60 * 1000; // 12 hours
+
+// Alternative: 6 hours for high-activity systems
 private snapshotRefreshInterval = 6 * 60 * 60 * 1000; // 6 hours
-```
 
-For testing with 30-second intervals:
-
-```typescript
+// Current: 30 seconds for testing
 private snapshotRefreshInterval = 30 * 1000; // 30 seconds
 ```
 
